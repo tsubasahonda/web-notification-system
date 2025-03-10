@@ -24,6 +24,33 @@ self.addEventListener("push", (event) => {
     const payload = event.data.json();
     console.log("プッシュ通知を受信:", payload);
 
+    // 接続テスト用の処理
+    if (payload.data && payload.data.type === "connection_test") {
+      console.log("疎通テスト通知を受信:", payload.data);
+
+      // クライアントに通知して応答
+      event.waitUntil(
+        clients
+          .matchAll({ type: "window", includeUncontrolled: true })
+          .then((clientList) => {
+            // 利用可能なクライアントにメッセージを送信
+            if (clientList.length > 0) {
+              clientList.forEach((client) => {
+                client.postMessage({
+                  type: "SERVER_SW_CONNECTION_TEST_RESPONSE",
+                  testId: payload.data.testId,
+                  timestamp: Date.now(),
+                  receivedTimestamp: payload.data.timestamp,
+                });
+              });
+            }
+          })
+      );
+
+      // 疎通テスト通知は表示されないようにする
+      return;
+    }
+
     // 通知履歴をLocalStorageに保存
     event.waitUntil(saveNotificationToHistory(payload));
 
@@ -127,6 +154,20 @@ self.addEventListener("notificationclose", (event) => {
 // メッセージの受信処理（メインスクリプトから通知表示リクエストを受け取る）
 self.addEventListener("message", (event) => {
   console.log("Service Workerがメッセージを受信しました:", event.data);
+
+  // 疎通確認テスト用のメッセージ
+  if (event.data && event.data.type === "CONNECTION_TEST") {
+    console.log("疎通確認テストメッセージを受信しました:", event.data.id);
+
+    // クライアントに応答を返す
+    event.source.postMessage({
+      type: "CONNECTION_TEST_RESPONSE",
+      id: event.data.id,
+      timestamp: Date.now(),
+    });
+
+    return;
+  }
 
   if (event.data && event.data.type === "PUSH_NOTIFICATION") {
     const notification = event.data.notification;

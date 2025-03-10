@@ -35,12 +35,22 @@ const NOTIFICATION_SUBSCRIPTION = gql`
 // メインの通知コンポーネント
 const NotificationSystem: React.FC = () => {
   // 状態管理
-  const swInitialized = useRef(false);
+  const swInitializedRef = useRef(false);
+  const testIdRef = useRef<string | null>(null);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [serviceWorkerRegistered, setServiceWorkerRegistered] = useState(false);
   const [subscribed, setSubscribed] = useState(false);
+
+  // 疎通確認用の状態
+  const [connectionStatus, setConnectionStatus] = useState({
+    serverHttp: "未確認",
+    serverWs: "未確認",
+    serviceWorker: "未確認",
+    serverToSw: "未確認",
+  });
+  const [connectionTestRunning, setConnectionTestRunning] = useState(false);
 
   // GraphQLサブスクリプション
   // Apolloクライアントで通知サブスクリプションを使用
@@ -70,9 +80,9 @@ const NotificationSystem: React.FC = () => {
     checkNotificationPermission();
 
     // Service Workerの登録
-    if (!swInitialized.current) {
+    if (!swInitializedRef.current) {
       initServiceWorker();
-      swInitialized.current = true;
+      swInitializedRef.current = true;
     }
 
     // メッセージリスナーを設定
@@ -146,6 +156,33 @@ const NotificationSystem: React.FC = () => {
         // 通知IDがあれば既読にする
         if (notification && notification.data && notification.data.id) {
           handleMarkAsRead(notification.data.id);
+        }
+      }
+
+      // サーバー→Service Worker疎通テスト応答
+      if (event.data.type === "SERVER_SW_CONNECTION_TEST_RESPONSE") {
+        console.log(
+          "SERVER_SW_CONNECTION_TEST_RESPONSE:",
+          event.data.testId,
+          testIdRef.current
+        );
+        if (event.data.testId === testIdRef.current) {
+          console.log("サーバー→Service Worker疎通テスト成功:", event.data);
+          setConnectionStatus((prev) => ({
+            ...prev,
+            serverToSw: `接続成功 (${Math.round(
+              event.data.timestamp - event.data.receivedTimestamp
+            )}ms) ✅`,
+          }));
+        } else {
+          console.log("古い疎通テスト応答を受信:", event.data);
+        }
+      }
+
+      // 直接疎通テスト応答
+      if (event.data.type === "CONNECTION_TEST_RESPONSE") {
+        if (event.data.id === testIdRef.current) {
+          console.log("Service Worker疎通テスト成功:", event.data);
         }
       }
     }
@@ -225,6 +262,210 @@ const NotificationSystem: React.FC = () => {
       console.error("テスト通知の送信に失敗:", error);
       alert("テスト通知の送信に失敗しました");
     }
+  };
+
+  // 疎通確認テスト
+  const runConnectionTest = async () => {
+    setConnectionTestRunning(true);
+
+    // 新しいテストIDを生成
+    const newTestId = Date.now().toString();
+    testIdRef.current = newTestId;
+
+    setConnectionStatus({
+      serverHttp: "テスト中...",
+      serverWs: "テスト中...",
+      serviceWorker: "テスト中...",
+      serverToSw: "テスト中...",
+    });
+
+    // HTTP疎通確認
+    try {
+      const httpResponse = await fetch(
+        "http://localhost:4000/api/vapid-public-key",
+        {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+
+      if (httpResponse.ok) {
+        setConnectionStatus((prev) => ({ ...prev, serverHttp: "接続成功 ✅" }));
+      } else {
+        setConnectionStatus((prev) => ({
+          ...prev,
+          serverHttp: `接続エラー: ${httpResponse.status} ❌`,
+        }));
+      }
+    } catch (error) {
+      console.error("HTTP接続テスト失敗:", error);
+      setConnectionStatus((prev) => ({
+        ...prev,
+        serverHttp: `接続失敗: ${
+          error instanceof Error ? error.message : "不明なエラー"
+        } ❌`,
+      }));
+    }
+
+    // WebSocket疎通確認
+    try {
+      const ws = new WebSocket("ws://localhost:4000/graphql");
+      let wsConnected = false;
+
+      // タイムアウト設定
+      const wsTimeout = setTimeout(() => {
+        if (!wsConnected) {
+          setConnectionStatus((prev) => ({
+            ...prev,
+            serverWs: "タイムアウト ❌",
+          }));
+          ws.close();
+        }
+      }, 5000);
+
+      ws.onopen = () => {
+        wsConnected = true;
+        setConnectionStatus((prev) => ({ ...prev, serverWs: "接続成功 ✅" }));
+        clearTimeout(wsTimeout);
+        ws.close();
+      };
+
+      ws.onerror = (err) => {
+        setConnectionStatus((prev) => ({ ...prev, serverWs: "接続失敗 ❌" }));
+        clearTimeout(wsTimeout);
+      };
+    } catch (error) {
+      console.error("WS接続テスト失敗:", error);
+      setConnectionStatus((prev) => ({
+        ...prev,
+        serverWs: `接続失敗: ${
+          error instanceof Error ? error.message : "不明なエラー"
+        } ❌`,
+      }));
+    }
+
+    // クライアント→Service Worker直接疎通確認
+    try {
+      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        // メッセージ送信用のユニークID
+        let messageReceived = false;
+
+        // 応答を待つ処理
+        const messagePromise = new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            if (!messageReceived) {
+              reject(new Error("タイムアウト"));
+            }
+          }, 3000);
+
+          const messageHandler = (event: MessageEvent) => {
+            if (
+              event.data &&
+              event.data.type === "CONNECTION_TEST_RESPONSE" &&
+              event.data.id === newTestId
+            ) {
+              messageReceived = true;
+              clearTimeout(timeout);
+              resolve();
+            }
+          };
+
+          // 一時的なメッセージリスナーを追加
+          const tempListener = (event: MessageEvent) => messageHandler(event);
+          navigator.serviceWorker.addEventListener("message", tempListener);
+
+          // プロミス解決時にリスナーを削除するクリーンアップ
+          setTimeout(() => {
+            navigator.serviceWorker.removeEventListener(
+              "message",
+              tempListener
+            );
+          }, 5000);
+        });
+
+        // Service Workerにメッセージを送信
+        navigator.serviceWorker.controller.postMessage({
+          type: "CONNECTION_TEST",
+          id: newTestId,
+        });
+
+        await messagePromise;
+        setConnectionStatus((prev) => ({
+          ...prev,
+          serviceWorker: "接続成功 ✅",
+        }));
+      } else {
+        setConnectionStatus((prev) => ({
+          ...prev,
+          serviceWorker: "Service Worker未登録または未アクティブ ❌",
+        }));
+      }
+    } catch (error) {
+      console.error("Service Worker接続テスト失敗:", error);
+      setConnectionStatus((prev) => ({
+        ...prev,
+        serviceWorker: `接続失敗: ${
+          error instanceof Error ? error.message : "不明なエラー"
+        } ❌`,
+      }));
+    }
+
+    // サーバー→Service Worker疎通確認
+    if (permissionGranted && subscribed) {
+      try {
+        // サーバー経由のテスト通知を送信
+        const serverTestResponse = await fetch(
+          "http://localhost:4000/api/connection-test",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ testId: newTestId }),
+          }
+        );
+
+        if (serverTestResponse.ok) {
+          const result = await serverTestResponse.json();
+
+          if (result.subscriptionCount === 0) {
+            setConnectionStatus((prev) => ({
+              ...prev,
+              serverToSw: "サブスクリプションがありません ❌",
+            }));
+          } else {
+            // 応答はService Workerからのメッセージイベントで受け取るので、
+            // タイムアウト設定のみ行う
+            setTimeout(() => {
+              setConnectionStatus((prev) => {
+                if (prev.serverToSw === "テスト中...") {
+                  return { ...prev, serverToSw: "タイムアウト ❌" };
+                }
+                return prev;
+              });
+            }, 10000);
+          }
+        } else {
+          setConnectionStatus((prev) => ({
+            ...prev,
+            serverToSw: `サーバーエラー: ${serverTestResponse.status} ❌`,
+          }));
+        }
+      } catch (error) {
+        console.error("サーバー→Service Worker接続テスト失敗:", error);
+        setConnectionStatus((prev) => ({
+          ...prev,
+          serverToSw: `接続失敗: ${
+            error instanceof Error ? error.message : "不明なエラー"
+          } ❌`,
+        }));
+      }
+    } else {
+      setConnectionStatus((prev) => ({
+        ...prev,
+        serverToSw: "通知許可または購読が必要です ❓",
+      }));
+    }
+
+    setConnectionTestRunning(false);
   };
 
   // 通知を既読にする
@@ -370,6 +611,89 @@ const NotificationSystem: React.FC = () => {
             </div>
           ))
         )}
+      </div>
+
+      {/* 疎通確認セクション */}
+      <div
+        className="connection-test"
+        style={{
+          marginTop: "20px",
+          padding: "15px",
+          border: "1px solid #ddd",
+          borderRadius: "5px",
+        }}
+      >
+        <h2 style={{ fontSize: "16px", marginBottom: "10px" }}>
+          システム疎通確認
+        </h2>
+        <button
+          className="btn btn-primary"
+          onClick={runConnectionTest}
+          disabled={connectionTestRunning}
+          style={{ marginBottom: "15px" }}
+        >
+          {connectionTestRunning ? "テスト実行中..." : "疎通テスト実行"}
+        </button>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "130px 1fr",
+            gap: "5px",
+          }}
+        >
+          <div style={{ fontWeight: "bold" }}>HTTPサーバー:</div>
+          <div
+            style={{
+              color: connectionStatus.serverHttp.includes("成功")
+                ? "green"
+                : connectionStatus.serverHttp === "未確認"
+                ? "#888"
+                : "red",
+            }}
+          >
+            {connectionStatus.serverHttp}
+          </div>
+
+          <div style={{ fontWeight: "bold" }}>WebSocketサーバー:</div>
+          <div
+            style={{
+              color: connectionStatus.serverWs.includes("成功")
+                ? "green"
+                : connectionStatus.serverWs === "未確認"
+                ? "#888"
+                : "red",
+            }}
+          >
+            {connectionStatus.serverWs}
+          </div>
+
+          <div style={{ fontWeight: "bold" }}>クライアント→SW:</div>
+          <div
+            style={{
+              color: connectionStatus.serviceWorker.includes("成功")
+                ? "green"
+                : connectionStatus.serviceWorker === "未確認"
+                ? "#888"
+                : "red",
+            }}
+          >
+            {connectionStatus.serviceWorker}
+          </div>
+
+          <div style={{ fontWeight: "bold" }}>サーバー→SW:</div>
+          <div
+            style={{
+              color: connectionStatus.serverToSw.includes("成功")
+                ? "green"
+                : connectionStatus.serverToSw === "未確認"
+                ? "#888"
+                : "red",
+            }}
+          >
+            {connectionStatus.serverToSw}
+          </div>
+        </div>
       </div>
 
       {/* デバッグ情報 */}

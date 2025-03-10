@@ -142,8 +142,6 @@ const resolvers = {
             },
           });
 
-          console.log("subscription", subscription.endpoint);
-
           webpush.sendNotification(subscription, payload).catch((error) => {
             console.error("Push通知の送信に失敗:", error);
             // 古いサブスクリプションを削除
@@ -397,6 +395,46 @@ async function startServer() {
     } catch (error) {
       console.error("通知の送信に失敗:", error);
       res.status(500).json({ error: error.message });
+    }
+  });
+
+  // 疎通確認テスト用エンドポイント
+  app.post("/api/connection-test", (req, res) => {
+    try {
+      const { testId } = req.body;
+
+      if (!testId) {
+        return res.status(400).json({ error: "testIdは必須です" });
+      }
+
+      // テスト用の小さなプッシュ通知をすべての登録済みサブスクリプションに送信
+      for (const subscription of subscriptionsStore) {
+        const payload = JSON.stringify({
+          title: "接続テスト",
+          body: "サーバーからService Workerへの疎通テスト",
+          data: {
+            type: "connection_test",
+            testId: testId,
+            timestamp: Date.now(),
+            isTest: true,
+          },
+        });
+
+        console.log("subscription", subscription);
+
+        webpush.sendNotification(subscription, payload).catch((error) => {
+          console.error("疎通テスト通知の送信に失敗:", error);
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "疎通テスト通知を送信しました",
+        subscriptionCount: subscriptionsStore.length,
+      });
+    } catch (error) {
+      console.error("疎通テストに失敗:", error);
+      res.status(500).json({ success: false, error: error.message });
     }
   });
 
