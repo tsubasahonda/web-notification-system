@@ -11,6 +11,7 @@ import {
   deleteNotification,
   clearNotificationHistory,
   sendTestNotification,
+  getUnreadCount,
 } from "@/utils/notification";
 
 // 通知サブスクリプションのGraphQLクエリ
@@ -71,10 +72,15 @@ const NotificationSystem: React.FC = () => {
 
   // マウント時の初期化
   useEffect(() => {
-    // LocalStorageから通知履歴を読み込む
-    const storedNotifications = getNotificationHistory();
-    setNotifications(storedNotifications);
-    setUnreadCount(storedNotifications.filter((n) => !n.read).length);
+    // IndexedDBから通知履歴を読み込む
+    const loadNotifications = async () => {
+      const storedNotifications = await getNotificationHistory();
+      setNotifications(storedNotifications);
+      const count = await getUnreadCount();
+      setUnreadCount(count);
+    };
+
+    loadNotifications();
 
     // 通知権限の確認
     checkNotificationPermission();
@@ -143,10 +149,9 @@ const NotificationSystem: React.FC = () => {
     if (event.data) {
       console.log("Service Workerからメッセージを受信:", event.data);
 
-      // 通知の保存
-      if (event.data.type === "SAVE_NOTIFICATION") {
-        const { notification } = event.data;
-        handleNewNotification(notification);
+      // 通知の更新をクライアント側で反映
+      if (event.data.type === "NOTIFICATION_UPDATED") {
+        refreshNotifications();
       }
 
       // 通知クリック
@@ -196,48 +201,16 @@ const NotificationSystem: React.FC = () => {
     );
   };
 
-  // 新しい通知の処理
-  const handleNewNotification = (notification: any) => {
-    const storedData = saveNotificationToLocalStorage(notification);
-    setNotifications(storedData.history);
-    setUnreadCount(storedData.unreadCount);
-  };
-
-  // 通知をLocalStorageに保存
-  const saveNotificationToLocalStorage = (notification: any) => {
-    // 現在の通知履歴を取得
-    let history = getNotificationHistory();
-
-    // 新しい通知を先頭に追加
-    const newNotification: Notification = {
-      id: notification.id || `notification-${Date.now()}`,
-      title: notification.title,
-      body: notification.body,
-      type: notification.type || "default",
-      timestamp: notification.timestamp || Date.now(),
-      read: false,
-      data: notification.data || {},
-    };
-
-    // 重複チェック
-    const isDuplicate = history.some((n) => n.id === newNotification.id);
-    if (!isDuplicate) {
-      history.unshift(newNotification);
-
-      // 最大保存数を超えた場合、古いものから削除
-      const MAX_NOTIFICATIONS = 50;
-      if (history.length > MAX_NOTIFICATIONS) {
-        history = history.slice(0, MAX_NOTIFICATIONS);
-      }
-
-      // LocalStorageに保存
-      localStorage.setItem("notificationHistory", JSON.stringify(history));
+  // 通知データを再取得して表示を更新
+  const refreshNotifications = async () => {
+    try {
+      const history = await getNotificationHistory();
+      setNotifications(history);
+      const count = await getUnreadCount();
+      setUnreadCount(count);
+    } catch (error) {
+      console.error("通知の更新に失敗しました:", error);
     }
-
-    // 未読の通知数を取得
-    const unreadCount = history.filter((n) => !n.read).length;
-
-    return { history, unreadCount };
   };
 
   // 通知の許可を要求
@@ -469,30 +442,30 @@ const NotificationSystem: React.FC = () => {
   };
 
   // 通知を既読にする
-  const handleMarkAsRead = (id: string) => {
-    const result = markNotificationAsRead(id);
+  const handleMarkAsRead = async (id: string) => {
+    const result = await markNotificationAsRead(id);
     setNotifications(result.history);
     setUnreadCount(result.unreadCount);
   };
 
   // すべての通知を既読にする
-  const handleMarkAllAsRead = () => {
-    const result = markAllNotificationsAsRead();
+  const handleMarkAllAsRead = async () => {
+    const result = await markAllNotificationsAsRead();
     setNotifications(result.history);
     setUnreadCount(result.unreadCount);
   };
 
   // 通知を削除する
-  const handleDeleteNotification = (id: string) => {
-    const result = deleteNotification(id);
+  const handleDeleteNotification = async (id: string) => {
+    const result = await deleteNotification(id);
     setNotifications(result.history);
     setUnreadCount(result.unreadCount);
   };
 
   // すべての通知を削除する
-  const handleClearAll = () => {
+  const handleClearAll = async () => {
     if (window.confirm("すべての通知を削除してもよろしいですか？")) {
-      const result = clearNotificationHistory();
+      const result = await clearNotificationHistory();
       setNotifications(result.history);
       setUnreadCount(result.unreadCount);
     }

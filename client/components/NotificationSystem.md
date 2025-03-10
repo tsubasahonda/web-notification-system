@@ -8,6 +8,7 @@
 
 - **GraphQL Subscription**: サーバーとの接続に GraphQL subscription を利用し、リアルタイムなデータストリームを確立します。
 - **サーバープッシュ通知**: サーバーからプッシュされる通知をリアルタイムで受信し、ユーザーに表示します。
+- **IndexedDBによるストレージ**: 通知データをブラウザのIndexedDBに保存し、Service Workerからも直接アクセス可能にします。
 
 ## 技術スタック
 
@@ -15,6 +16,7 @@
 - サーバープッシュ
 - Service Worker
 - Web Push API
+- IndexedDB
 
 ## 詳細設計
 
@@ -25,6 +27,7 @@ sequenceDiagram
     participant User as ユーザー
     participant NS as NotificationSystem
     participant SW as Service Worker
+    participant IDB as IndexedDB
     participant Server as サーバー (Express)
     participant GraphQL as GraphQL Server
     participant WebPush as Web Push
@@ -44,10 +47,10 @@ sequenceDiagram
         GraphQL->>+WebPush: プッシュ通知を送信
         WebPush-->>SW: Push イベントを発火
         SW->>SW: 通知データを解析
+        SW->>IDB: 通知データを保存
         SW->>SW: ブラウザ通知を表示<br>registration.showNotification()
-        SW-->>NS: message イベントで通知<br>type: SAVE_NOTIFICATION
-        NS->>NS: handleNewNotification()
-        NS->>NS: saveNotificationToLocalStorage()
+        SW-->>NS: message イベントで通知<br>type: NOTIFICATION_UPDATED
+        NS->>IDB: 最新の通知データを取得
         NS->>NS: 状態を更新<br>notifications, unreadCount
     end
 
@@ -60,7 +63,7 @@ sequenceDiagram
     SW->>SW: 通知を閉じる
     SW->>SW: クリックされたURLを特定
     SW-->>NS: message イベントで通知<br>type: NOTIFICATION_CLICKED
-    NS->>NS: handleMarkAsRead()
+    NS->>IDB: 通知を既読状態に更新
     NS->>NS: 状態を更新<br>通知を既読状態に
 ```
 
@@ -70,12 +73,15 @@ sequenceDiagram
 sequenceDiagram
     participant NS as NotificationSystem
     participant Browser as ブラウザAPI
+    participant IDB as IndexedDB
     participant SW as Service Worker
     participant Server as サーバー
 
     NS->>NS: useEffect (初期化)
-    NS->>Browser: getNotificationHistory()<br>LocalStorageから通知を読み込み
-    Browser-->>NS: 保存済み通知データ
+    NS->>IDB: getNotificationHistory()<br>IndexedDBから通知を読み込み
+    IDB-->>NS: 保存済み通知データ
+    NS->>IDB: getUnreadCount()<br>未読数を取得
+    IDB-->>NS: 未読通知数
     NS->>NS: 通知データと未読数を状態にセット
 
     NS->>Browser: checkNotificationPermission()
@@ -142,17 +148,38 @@ sequenceDiagram
   }
   ```
 
+### IndexedDBストレージ
+
+- **データベース構造**: IndexedDBデータベースに通知が保存されます。
+  ```typescript
+  interface NotificationDatabase {
+    name: 'NotificationSystem';
+    version: 1;
+    stores: {
+      notifications: {
+        keyPath: 'id';
+        indexes: {
+          timestamp: { unique: false };
+          read: { unique: false };
+        }
+      }
+    }
+  }
+  ```
+- **Service Worker連携**: Service Workerは直接IndexedDBにアクセスして通知データを操作します。これにより、アプリケーションがアクティブでない場合でも通知データを管理できます。
+- **非同期アクセス**: IndexedDBへのアクセスは全て非同期（Promise）ベースのAPIで実装されています。
+
 ### サーバープッシュ通知
 
 - **Service Worker**: `service-worker.js` で Service Worker を登録し、プッシュ通知をリッスンします。
 - **メッセージング**: Service Worker から `message` イベントを介して、受信したプッシュ通知データが `NotificationSystem` コンポーネントに渡されます。
 - **イベント種別**: Service Worker から送信されるメッセージには以下の種別があります。
-  - `SAVE_NOTIFICATION`: 新しい通知を受信した場合
+  - `NOTIFICATION_UPDATED`: 新しい通知を受信または更新した場合
   - `NOTIFICATION_CLICKED`: 通知がクリックされた場合
 
 ### 状態管理
 
-- **`notifications: Notification[]`**: 通知履歴を保持する状態変数。LocalStorage から初期化され、新しい通知が追加されるたびに更新されます。
+- **`notifications: Notification[]`**: 通知履歴を保持する状態変数。IndexedDB から非同期に初期化され、新しい通知が追加されるたびに更新されます。
 - **`unreadCount: number`**: 未読通知数を保持する状態変数。通知が既読になるか、新しい通知が追加されるたびに更新されます。
 - **`permissionGranted: boolean`**: 通知許可の状態を保持する状態変数。`checkNotificationPermission` 関数で更新されます。
 - **`serviceWorkerRegistered: boolean`**: Service Worker の登録状態を保持する状態変数。`initServiceWorker` 関数で更新されます。
@@ -163,6 +190,7 @@ sequenceDiagram
 - **通知許可**: `handleRequestPermission` 関数で `requestNotificationPermission` 関数を呼び出し、ユーザーに通知許可を要求します。許可状態は `permissionGranted` 状態変数に反映されます。
 - **Service Worker 登録**: `initServiceWorker` 関数で `registerServiceWorker` 関数を呼び出し、Service Worker を登録します。登録状態は `serviceWorkerRegistered` 状態変数に反映されます。プッシュ通知が許可されている場合、`subscribeToPushNotifications` 関数を呼び出してプッシュ通知を購読します。購読状態は `subscribed` 状態変数に反映されます。
 - **テスト通知**: `handleSendTestNotification` 関数で `sendTestNotification` 関数を呼び出し、テスト通知を送信します。
+- **通知の更新**: `refreshNotifications` 関数でIndexedDBから最新の通知データを取得し、UIを更新します。
 - **既読処理**:
   - `handleMarkAsRead(id)`: 指定された ID の通知を既読にします。`markNotificationAsRead` 関数を呼び出し、`notifications` と `unreadCount` 状態変数を更新します。
   - `handleMarkAllAsRead()`: すべての通知を既読にします。`markAllNotificationsAsRead` 関数を呼び出し、`notifications` と `unreadCount` 状態変数を更新します。
@@ -186,4 +214,5 @@ sequenceDiagram
 - **通知カテゴリのサポート**: 異なるカテゴリの通知に対して、フィルタリングや表示のカスタマイズを追加する。
 - **通知設定**: ユーザーが通知の種類やタイミングをカスタマイズできる設定画面を追加する。
 - **通知のグループ化**: 類似した通知をグループ化し、UIをスッキリさせる機能を追加する。
-- **オフライン対応**: オフライン時に通知を保存し、オンライン復帰時に同期する機能を追加する。
+- **オフライン対応**: 既にIndexedDBを使用しているため、オフライン時の通知管理が容易になりました。オフラインで生成された通知の同期システムを追加することができます。
+- **バックグラウンド処理の強化**: Service WorkerとIndexedDBの組み合わせにより、バックグラウンドでの通知処理をさらに強化できます。

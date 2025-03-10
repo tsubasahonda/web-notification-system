@@ -1,5 +1,11 @@
 // service-worker.js
 
+// IndexedDB関連の定数
+const DB_NAME = 'NotificationSystem';
+const DB_VERSION = 1;
+const STORE_NAME = 'notifications';
+const MAX_NOTIFICATION_HISTORY = 50;
+
 // Service Workerのインストール
 self.addEventListener("install", (event) => {
   console.log("Service Workerをインストールしました");
@@ -51,7 +57,7 @@ self.addEventListener("push", (event) => {
       return;
     }
 
-    // 通知履歴をLocalStorageに保存
+    // 通知履歴にIndexedDBに保存
     event.waitUntil(saveNotificationToHistory(payload));
 
     // 通知を表示
@@ -65,6 +71,8 @@ self.addEventListener("push", (event) => {
         timestamp: payload.timestamp || Date.now(),
       })
     );
+
+    console.log("プッシュ通知の処理が完了しました");
   } catch (error) {
     console.error("プッシュ通知の処理中にエラーが発生しました:", error);
     // テキストとして処理を試みる
@@ -187,28 +195,161 @@ self.addEventListener("message", (event) => {
   }
 });
 
-// LocalStorageを使用するためのヘルパー関数
-// ServiceWorkerはLocalStorageに直接アクセスできないため、クライアントを経由する必要がある
-async function saveNotificationToHistory(notification) {
-  // すべてのクライアントを取得
-  const allClients = await clients.matchAll();
+// IndexedDBを開く
+async function openDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-  if (allClients.length > 0) {
-    // LocalStorageに保存するための処理を一つのクライアントに委託
-    allClients[0].postMessage({
-      type: "SAVE_NOTIFICATION",
-      notification: {
-        title: notification.title,
-        body: notification.body,
-        data: notification.data || {},
-        timestamp: notification.timestamp || Date.now(),
-      },
+    request.onerror = (event) => {
+      console.error('Service Worker: IndexedDBを開けませんでした:', event);
+      reject(new Error('データベースを開けませんでした'));
+    };
+
+    request.onsuccess = (event) => {
+      resolve(request.result);
+    };
+
+    request.onupgradeneeded = (event) => {
+      const db = request.result;
+      
+      // オブジェクトストアが存在しない場合は作成
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        store.createIndex('timestamp', 'timestamp', { unique: false });
+        store.createIndex('readIndex', 'readIndex', { unique: false }); // 数値インデックス（0=未読, 1=既読）
+      }
+    };
+  });
+}
+
+// 通知をIndexedDBに保存
+async function saveNotificationToHistory(notification) {
+  try {
+    // データベースを開く
+    const db = await openDatabase();
+    
+    // 新しい通知オブジェクトを作成
+    const newNotification = {
+      id: notification.id || generateId(),
+      title: notification.title,
+      body: notification.body,
+      type: notification.type,
+      timestamp: notification.timestamp || Date.now(),
+      read: false,
+      readIndex: 0, // 未読用の数値インデックス
+      data: notification.data || {},
+    };
+    
+    // 保存処理
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      
+      const addRequest = store.add(newNotification);
+      
+      addRequest.onsuccess = () => {
+        resolve();
+      };
+      
+      addRequest.onerror = (event) => {
+        console.error('Service Worker: 通知の保存に失敗しました:', event);
+        reject(new Error('通知の保存に失敗しました'));
+      };
+      
+      transaction.oncomplete = () => {
+        db.close();
+      };
     });
-  } else {
-    // アクティブなクライアントがない場合はIndexedDBに保存する
-    // （この例ではIndexedDBの実装は省略）
-    console.log(
-      "アクティブなクライアントがないため、通知履歴を保存できませんでした"
-    );
+    
+    // 履歴の最大数を超えた場合、古いものを削除
+    await trimNotificationHistory();
+    
+    // クライアントに通知が更新されたことを通知
+    const allClients = await clients.matchAll();
+    if (allClients.length > 0) {
+      allClients.forEach(client => {
+        client.postMessage({
+          type: "NOTIFICATION_UPDATED",
+          notification: newNotification
+        });
+      });
+    }
+    
+    return;
+  } catch (error) {
+    console.error('Service Worker: 通知履歴の保存に失敗しました:', error);
   }
+}
+
+// 通知履歴のサイズを制限する
+async function trimNotificationHistory() {
+  try {
+    const db = await openDatabase();
+    
+    // 全ての通知を取得
+    const notifications = await new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_NAME], 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const index = store.index('timestamp');
+      const request = index.getAll();
+      
+      request.onsuccess = () => {
+        resolve(request.result);
+      };
+      
+      request.onerror = (event) => {
+        console.error('Service Worker: 通知履歴の取得に失敗しました:', event);
+        reject(new Error('通知履歴の取得に失敗しました'));
+      };
+    });
+    
+    // 最大数を超えていなければ何もしない
+    if (notifications.length <= MAX_NOTIFICATION_HISTORY) {
+      db.close();
+      return;
+    }
+    
+    // タイムスタンプでソートして古いものを特定
+    notifications.sort((a, b) => b.timestamp - a.timestamp);
+    const notificationsToDelete = notifications.slice(MAX_NOTIFICATION_HISTORY);
+    
+    // 古い通知を削除
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      
+      let completed = 0;
+      let failed = false;
+      
+      notificationsToDelete.forEach(notification => {
+        const request = store.delete(notification.id);
+        
+        request.onsuccess = () => {
+          completed++;
+          if (completed === notificationsToDelete.length && !failed) {
+            resolve();
+          }
+        };
+        
+        request.onerror = (event) => {
+          if (!failed) {
+            failed = true;
+            console.error('Service Worker: 通知の削除に失敗しました:', event);
+            reject(new Error('通知の削除に失敗しました'));
+          }
+        };
+      });
+      
+      transaction.oncomplete = () => {
+        db.close();
+      };
+    });
+  } catch (error) {
+    console.error('Service Worker: 通知履歴のトリミングに失敗しました:', error);
+  }
+}
+
+// 一意のID生成関数
+function generateId() {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
 }
