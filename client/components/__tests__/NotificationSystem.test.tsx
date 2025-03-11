@@ -8,20 +8,46 @@ import * as notificationUtils from "@/utils/notification";
 vi.mock("@/utils/notification");
 
 describe("NotificationSystem", () => {
+  // モックの準備
+  const mockRegistration = {
+    scope: "http://localhost/",
+    pushManager: {
+      getSubscription: vi.fn().mockResolvedValue(undefined),
+      subscribe: vi.fn().mockResolvedValue({
+        endpoint: "https://example.com",
+      }),
+    },
+  };
+
   // セットアップとクリーンアップ
   beforeEach(() => {
-    // localStorage のモックをクリア
-    window.localStorage.clear();
-
     // モック関数をリセット
     vi.clearAllMocks();
 
+    // navigator.serviceWorkerのモック
+    Object.defineProperty(navigator, "serviceWorker", {
+      value: {
+        register: vi.fn().mockResolvedValue(mockRegistration),
+        addEventListener: vi.fn(),
+      },
+      configurable: true,
+    });
+
     // mockReturnValue の初期値を設定
     vi.mocked(notificationUtils.getNotificationHistory).mockResolvedValue([]);
-  });
 
-  afterEach(() => {
-    vi.resetAllMocks();
+    vi.mock("@apollo/client", async () => {
+      const actual = await vi.importActual("@apollo/client");
+      return {
+        ...actual,
+        useQuery: vi.fn().mockReturnValue({
+          loading: false,
+          error: null,
+          data: { getNotifications: [] },
+        }),
+        gql: vi.fn().mockImplementation((query) => query),
+      };
+    });
   });
 
   // 基本的なレンダリングテスト
@@ -75,21 +101,25 @@ describe("NotificationSystem", () => {
     render(<NotificationSystem />);
 
     // 通知タイトルが表示されていること
-    expect(screen.getByText("テスト通知1")).toBeInTheDocument();
-    expect(screen.getByText("テスト通知2")).toBeInTheDocument();
+    waitFor(() => expect(screen.getByText("テスト通知1")).toBeInTheDocument());
+    waitFor(() => expect(screen.getByText("テスト通知2")).toBeInTheDocument());
 
     // 通知の本文が表示されていること
-    expect(screen.getByText("これはテスト通知1です")).toBeInTheDocument();
-    expect(screen.getByText("これはテスト通知2です")).toBeInTheDocument();
+    waitFor(() =>
+      expect(screen.getByText("これはテスト通知1です")).toBeInTheDocument()
+    );
+    waitFor(() =>
+      expect(screen.getByText("これはテスト通知2です")).toBeInTheDocument()
+    );
 
     // 未読通知には「既読にする」ボタンがあること
-    expect(screen.getByText("既読にする")).toBeInTheDocument();
+    waitFor(() => expect(screen.getByText("既読にする")).toBeInTheDocument());
 
     // すべての通知には「削除」ボタンがあること
-    expect(screen.getAllByText("削除")).toHaveLength(2);
+    waitFor(() => expect(screen.getAllByText("削除")).toHaveLength(2));
 
     // URLがある通知には「開く」リンクがあること
-    expect(screen.getByText("開く")).toBeInTheDocument();
+    waitFor(() => expect(screen.getByText("開く")).toBeInTheDocument());
   });
 
   // 通知の既読処理のテスト
@@ -123,7 +153,7 @@ describe("NotificationSystem", () => {
     render(<NotificationSystem />);
 
     // 「既読にする」ボタンをクリック
-    const readButton = screen.getByText("既読にする");
+    const readButton = await waitFor(() => screen.getByText("既読にする"));
     await user.click(readButton);
 
     // 既読処理関数が呼ばれること
@@ -208,7 +238,7 @@ describe("NotificationSystem", () => {
     render(<NotificationSystem />);
 
     // 「削除」ボタンをクリック
-    const deleteButton = screen.getByText("削除");
+    const deleteButton = await waitFor(() => screen.getByText("削除"));
     await user.click(deleteButton);
 
     // 削除処理関数が呼ばれること
